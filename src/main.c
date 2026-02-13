@@ -113,16 +113,12 @@ int main(int argc, const char *argv[])
             warn("Socket optimization failed, continuing anyway");
         }
 
+        /* Receive loop blocks internally (poll-based). This call only returns on error. */
         rc = es_local_start_recv(node);
         if (rc != ES_EOK)
         {
             err("Failed to start receiving");
             goto restart;
-        }
-
-        while (ES_TRUE)
-        {
-            pause();
         }
 
 restart:

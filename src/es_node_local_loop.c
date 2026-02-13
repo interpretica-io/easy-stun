@@ -1,153 +1,156 @@
 #include <inttypes.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include <errno.h>
+#include <time.h>
+#include <poll.h>
+
 #include "es_node.h"
 #include "es_status.h"
-#include "stun.h"
-#include "es_msg.h"
 #include "es_bool.h"
 #include "debug.h"
-#include "helper.h"
-#include <signal.h>
-#include <time.h>
-#include <errno.h>
-#ifdef __APPLE__
-#include "mac_time.h"
+
+/*
+ * Portable, event-driven receive loop.
+ *
+ * Replaces the previous timer-driven polling approach with a blocking poll(2)
+ * loop that:
+ *   - wakes up immediately when the socket becomes readable
+ *   - drains the UDP receive queue (recvfrom in es_local_recv() is non-blocking)
+ *   - performs keepalive pings on schedule without busy-waiting
+ *
+ * Notes:
+ *   - es_local_recv() is expected to be non-blocking and return ES_ENODATA when
+ *     no datagrams are available (EAGAIN/EWOULDBLOCK).
+ *   - Keepalive interval is in seconds (per existing params).
+ */
+
+static uint64_t
+now_ms(void)
+{
+    struct timespec ts;
+
+#if defined(CLOCK_MONOTONIC)
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
 #endif
 
-#ifdef __APPLE__
-#define USED_CLOCK (CLOCK_REALTIME)
-#else
-#define USED_SIG (SIGRTMIN + 2)
-#define USED_CLOCK (CLOCK_MONOTONIC)
-#endif
+    /* Fallback: wall clock (still fine for basic timeouts) */
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
 
-static timer_t timer;
-static es_node *loop_node;
-static int counter = 0;
+static int
+clamp_poll_timeout_ms(int64_t v)
+{
+    if (v <= 0)
+        return 0;
+    if (v > 2147483647LL)
+        return 2147483647;
+    return (int)v;
+}
 
 static void
-timer_callback_rebind(void)
+do_keepalive(es_node *node)
 {
-    es_bool rebind = ES_FALSE;
-    es_bool keep_alive = ES_FALSE;
-    es_status rc;
-    int packets_processed = 0;
-    int max_burst = 100;  /* Process up to 100 packets per timer tick */
+    dbg("[%s:%u] Connection needs keepalive - ping",
+        node->params.remote_addr,
+        (unsigned)node->params.remote_port);
 
-    counter++;
-
-    /* Burst processing - drain receive queue */
-    while (packets_processed < max_burst)
-    {
-        rc = es_local_recv(loop_node);
-
-        if (rc == ES_ENODATA)
-        {
-            /* No more data available */
-            break;
-        }
-        else if (es_status_is_conn_broken(rc))
-        {
-            rebind = ES_TRUE;
-            break;
-        }
-
-        packets_processed++;
-    }
-
-    if (rebind)
-    {
-        dbg("[%s:%u] Connection is broken - rebind",
-            loop_node->params.remote_addr,
-            (unsigned)loop_node->params.remote_port);
-        es_twoway_bind(loop_node);
-    }
-
-    /* Keepalive check - counter increments every 100ms, so multiply by 10 for seconds */
-    if ((counter % (loop_node->params.keepalive_interval * 10)) == 0)
-    {
-        dbg("[%s:%u] Connection needs keepalive - ping",
-            loop_node->params.remote_addr,
-            (unsigned)loop_node->params.remote_port);
-        keep_alive = ES_TRUE;
-        es_remote_ping(loop_node, ES_FALSE);
-        es_remote_ping(loop_node, ES_TRUE);
-    }
+    (void)es_remote_ping(node, ES_FALSE);
+    (void)es_remote_ping(node, ES_TRUE);
 }
-
-#ifdef __APPLE__
-void
-timer_callback(union sigval signo)
-{
-    timer_callback_rebind();
-}
-#else
-void
-timer_callback(int signo, siginfo_t *info,
-               void *context)
-{
-    if (info->si_code == SI_TIMER)
-    {
-        timer_callback_rebind();
-    }
-}
-#endif
 
 es_status
 es_local_start_recv(es_node *node)
 {
-    struct itimerspec value;
-    sigset_t mask;
-    siginfo_t info;
-    struct sigevent sigev;
-    struct sigaction sa;
+    struct pollfd pfd;
+    uint64_t next_keepalive_ms = 0;
+    const uint32_t ka_interval_s = node->params.keepalive_interval;
 
-    sigemptyset(&mask);
-    sigprocmask(SIG_SETMASK, &mask, NULL);
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = node->sk;
+    pfd.events = POLLIN;
 
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
+    if (ka_interval_s > 0)
+        next_keepalive_ms = now_ms() + (uint64_t)ka_interval_s * 1000ull;
 
-    UNUSED(info);
-
-    loop_node = node;
-#ifndef __APPLE__
-    sa.sa_sigaction = timer_callback;
-
-    if (sigaction(USED_SIG, &sa, NULL) == -1)
+    for (;;)
     {
-        err("sigaction() failed: %s", strerror(errno));
-        return ES_EFAIL;
+        uint64_t now = now_ms();
+        int timeout_ms = -1;
+
+        if (ka_interval_s > 0)
+        {
+            int64_t delta = (int64_t)(next_keepalive_ms - now);
+            timeout_ms = clamp_poll_timeout_ms(delta);
+        }
+
+        /* Block until readable or next keepalive is due. */
+        int pret;
+        do
+        {
+            pret = poll(&pfd, 1, timeout_ms);
+        } while (pret < 0 && errno == EINTR);
+
+        if (pret < 0)
+        {
+            err("poll() failed: %s", strerror(errno));
+            return ES_EFAIL;
+        }
+
+        now = now_ms();
+
+        /* Keepalive timer. */
+        if (ka_interval_s > 0 && now >= next_keepalive_ms)
+        {
+            do_keepalive(node);
+            next_keepalive_ms = now + (uint64_t)ka_interval_s * 1000ull;
+        }
+
+        /* Socket readable: drain receive queue. */
+        if (pret > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP)))
+        {
+            for (;;)
+            {
+                es_status rc = es_local_recv(node);
+
+                if (rc == ES_ENODATA)
+                {
+                    /* Drained. */
+                    break;
+                }
+
+                if (es_status_is_conn_broken(rc))
+                {
+                    dbg("[%s:%u] Connection is broken - rebind",
+                        node->params.remote_addr,
+                        (unsigned)node->params.remote_port);
+
+                    (void)es_twoway_bind(node);
+
+                    /*
+                     * After rebind, expected_tid and mapping state change;
+                     * also reset keepalive schedule from "now" so we don't
+                     * immediately ping again after transient errors.
+                     */
+                    if (ka_interval_s > 0)
+                        next_keepalive_ms = now_ms() + (uint64_t)ka_interval_s * 1000ull;
+
+                    break;
+                }
+
+                /*
+                 * For other statuses: continue draining. es_local_recv() handles
+                 * protocol-level errors (e.g., wrong TID) without requiring loop changes.
+                 */
+            }
+        }
+
+        /* Clear revents for next poll iteration. */
+        pfd.revents = 0;
     }
-#endif
 
-#ifdef __APPLE__
-    sigev.sigev_notify = SIGEV_THREAD;
-    sigev.sigev_notify_function = timer_callback;
-#else
-    sigev.sigev_notify = SIGEV_SIGNAL;
-    sigev.sigev_signo = USED_SIG;
-#endif
-    sigev.sigev_value.sival_int = 1;
-
-    /* Set timer to 100ms for faster packet processing */
-    value.it_value.tv_sec = 0;
-    value.it_value.tv_nsec = 100000000;  /* 100ms */
-    value.it_interval.tv_sec = 0;
-    value.it_interval.tv_nsec = 100000000;  /* 100ms */
-
-    if (timer_create(USED_CLOCK, &sigev, &timer) != 0)
-    {
-        printf("timer_create() failed: %s\n", strerror(errno));
-        return ES_EFAIL;
-    }
-
-    timer_settime(timer, 0, &value, NULL);
-    return ES_EOK;
+    /* Unreachable */
+    /* return ES_EOK; */
 }
