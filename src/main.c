@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include "stun.h"
 #include "debug.h"
 
@@ -56,6 +58,37 @@ optimize_socket(int sockfd)
     return 0;
 }
 
+static void
+es_reap_children(int signo)
+{
+    (void)signo;
+
+    /* Reap all finished children (non-blocking). */
+    for (;;)
+    {
+        int status;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid <= 0)
+            break;
+
+        if (WIFEXITED(status))
+        {
+            ring("Script process %ld exited with code %d",
+                 (long)pid, WEXITSTATUS(status));
+        }
+        else if (WIFSIGNALED(status))
+        {
+            ring("Script process %ld terminated by signal %d",
+                 (long)pid, WTERMSIG(status));
+        }
+        else
+        {
+            ring("Script process %ld finished (status=0x%x)",
+                 (long)pid, status);
+        }
+    }
+}
+
 int main(int argc, const char *argv[])
 {
     es_status rc;
@@ -92,6 +125,22 @@ int main(int argc, const char *argv[])
         freopen("/dev/null", "r", stdin);
         freopen("/dev/null", "w", stdout);
         freopen("/dev/null", "w", stderr);
+    }
+
+    /*
+     * Reap child processes spawned for scripts (fire-and-forget) without blocking.
+     * Use SA_RESTART so syscalls like poll() resume across signals.
+     */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = es_reap_children;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+        if (sigaction(SIGCHLD, &sa, NULL) != 0)
+        {
+            warn("sigaction(SIGCHLD) failed: %s", strerror(errno));
+        }
     }
 
     es_init(node);

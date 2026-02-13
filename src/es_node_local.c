@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/types.h>
 #include "es_node.h"
 #include "es_status.h"
 #include "stun.h"
@@ -138,14 +139,21 @@ es_local_process_binding_response(es_node *node,
 
     {
         char full_cmd[1024];
-        int ret;
+        pid_t pid;
 
         sprintf(full_cmd, "%s bind %s %u", node->params.script,
             node->status.mapped_addr,
             (unsigned)node->status.mapped_port);
-        ret = system(full_cmd);
-        ring("Script '%s' executed with return code %d", node->params.script,
-             ret);
+
+        pid = es_spawn_sh_noblock(full_cmd);
+        if (pid < 0)
+        {
+            warn("Failed to spawn script '%s': %s", node->params.script, strerror(errno));
+        }
+        else
+        {
+            ring("Script '%s' spawned (pid %ld)", node->params.script, (long)pid);
+        }
     }
     return ES_EOK;
 }
