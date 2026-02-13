@@ -26,6 +26,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Determine where the CMake project root is.
+      # Some repo layouts have CMakeLists.txt at the repository root,
+      # others keep the project under ./easy-stun.
+      - name: Detect project root
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f CMakeLists.txt ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+          elif [ -f easy-stun/CMakeLists.txt ]; then
+            echo "PROJECT_DIR=easy-stun" >> "$GITHUB_ENV"
+          else
+            echo "Could not find CMakeLists.txt in '.' or './easy-stun'" >&2
+            ls -la
+            exit 1
+          fi
+          echo "Detected PROJECT_DIR=${PROJECT_DIR:-<unset>}"
+
       - name: Install dependencies (Ubuntu)
         if: runner.os == 'Linux'
         run: |
@@ -41,26 +59,30 @@ jobs:
 
       - name: Configure (Ubuntu)
         if: runner.os == 'Linux'
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          cmake -S easy-stun -B easy-stun/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Configure (macOS)
         if: runner.os == 'macOS'
+        working-directory: ${{ env.PROJECT_DIR }}
         env:
           OPENSSL_ROOT_DIR: /opt/homebrew/opt/openssl@3
           PKG_CONFIG_PATH: /opt/homebrew/opt/openssl@3/lib/pkgconfig
         run: |
-          cmake -S easy-stun -B easy-stun/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          cmake --build easy-stun/build
+          cmake --build build
 
       - name: Package artifact
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
-          BIN="easy-stun/build/easy-stun"
+          BIN="build/easy-stun"
           test -f "$BIN"
 
           OS="${{ runner.os }}"
@@ -72,7 +94,7 @@ jobs:
           cp "$BIN" "$OUTDIR/easy-stun"
           (cd "$OUTDIR" && tar -czf "${NAME}.tar.gz" easy-stun)
 
-          echo "ASSET_PATH=$OUTDIR/${NAME}.tar.gz" >> "$GITHUB_ENV"
+          echo "ASSET_PATH=${{ env.PROJECT_DIR }}/$OUTDIR/${NAME}.tar.gz" >> "$GITHUB_ENV"
           echo "ASSET_NAME=${NAME}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload build artifact (non-tag)
