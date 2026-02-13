@@ -1,0 +1,93 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config libssl-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install cmake ninja openssl@3 pkg-config
+
+      - name: Configure (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S easy-stun -B easy-stun/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        env:
+          OPENSSL_ROOT_DIR: /opt/homebrew/opt/openssl@3
+          PKG_CONFIG_PATH: /opt/homebrew/opt/openssl@3/lib/pkgconfig
+        run: |
+          cmake -S easy-stun -B easy-stun/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cmake --build easy-stun/build
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="easy-stun/build/easy-stun"
+          test -f "$BIN"
+
+          OS="${{ runner.os }}"
+          ARCH="${{ runner.arch }}"
+          OUTDIR="dist"
+          mkdir -p "$OUTDIR"
+
+          NAME="easy-stun-${OS}-${ARCH}"
+          cp "$BIN" "$OUTDIR/easy-stun"
+          (cd "$OUTDIR" && tar -czf "${NAME}.tar.gz" easy-stun)
+
+          echo "ASSET_PATH=$OUTDIR/${NAME}.tar.gz" >> "$GITHUB_ENV"
+          echo "ASSET_NAME=${NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact (non-tag)
+        if: startsWith(github.ref, 'refs/tags/') != true
+        uses: actions/upload-artifact@v4
+        with:
+          name: easy-stun-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ env.ASSET_PATH }}
+          if-no-files-found: error
+
+      - name: Upload release asset (tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET_PATH }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
