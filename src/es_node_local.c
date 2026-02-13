@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <netinet/in.h>
@@ -183,90 +184,79 @@ es_local_process_binding_error(es_node *node,
 es_status
 es_local_recv(es_node *node)
 {
-    char buf[4096];
-    unsigned int addr_len;
-    struct timeval timeout;
+    char buf[8192] __attribute__((aligned(64)));  /* Larger buffer, cache-aligned */
+    unsigned int addr_len = sizeof(struct sockaddr_in);
     struct sockaddr_in addr = {0};
-    fd_set fds;
     int ret;
     stun_hdr *hdr;
     uint16_t message_type;
     es_msg msg;
-    es_bool processed = ES_FALSE;
+    uint32_t magic_cookie;
 
+    /* Fast path: direct recvfrom without select (non-blocking socket) */
+    ret = recvfrom(node->sk, buf, sizeof(buf), MSG_DONTWAIT, 
+                   (struct sockaddr *)&addr, &addr_len);
+    
+    if (ret == -1)
+    {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+            /* No data available - this is normal for non-blocking sockets */
+            return ES_ENODATA;
+        }
+        /* Real error */
+        err("Receive failure: %s", strerror(errno));
+        return ES_ERECVFAIL;
+    }
+
+    if (ret == 0)
+    {
+        /* Connection closed */
+        return ES_ERECVFAIL;
+    }
+
+    /* Setup message structure */
     msg.hdr = (stun_hdr *)buf;
     msg.max_len = sizeof(buf);
 
-    FD_ZERO(&fds);
-    FD_SET(node->sk, &fds);
-
-    memset(&timeout, 0, sizeof(timeout));
-    timeout.tv_sec = 2;
-
-    ret = select(node->sk + 1, &fds, NULL, NULL, &timeout);
-    if (ret == 0)
+    /* Fast path: check if it's a STUN message */
+    hdr = (stun_hdr *)buf;
+    
+    /* Quick size check first (most likely to fail fast) */
+    if (ret < sizeof(stun_hdr))
     {
-        dbg("Selecting - no data");
-        return ES_ENODATA;
-    }
-    else if (ret == -1)
-    {
-        dbg("Selecting - recv failed");
-        return ES_ERECVFAIL;
+        /* Too small for STUN, likely a connection request */
+        return es_local_conn_request(node, buf, ret);
     }
 
-    dbg("Selecting");
-    ret = recvfrom(node->sk, buf, sizeof(buf), 0, (struct sockaddr *)&addr,
-                   &addr_len);
-    if (ret == -1)
+    /* Check magic cookie - use direct comparison without debug in hot path */
+    magic_cookie = ntohl(hdr->magic_cookie);
+    if (magic_cookie != STUN_MAGIC_COOKIE)
     {
-        err("Receive failure");
-        return ES_ERECVFAIL;
+        /* Not a STUN message - treat as connection request */
+        return es_local_conn_request(node, buf, ret);
     }
 
-    ES_BREAKABLE_START()
+    /* Verify transaction ID */
+    if (memcmp(hdr->tid, node->status.expected_tid, 
+               sizeof(node->status.expected_tid)) != 0)
     {
-        hdr = (stun_hdr *)buf;
-        if (ret < sizeof(stun_hdr))
-        {
-            dbg("Not STUN response: %d vs %lu", ret, sizeof(stun_hdr));
-            break;
-        }
-
-        if (ntohl(hdr->magic_cookie) != STUN_MAGIC_COOKIE)
-        {
-            dbg("Invalid STUN magic: %x vs %x", ntohl(hdr->magic_cookie),
-                STUN_MAGIC_COOKIE);
-            break;
-        }
-
-        if (memcmp(hdr->tid,
-                   node->status.expected_tid,
-                   sizeof(node->status.expected_tid)) != 0)
-        {
-            err("Unexpected transaction ID");
-            return ES_EWRONGTID;
-        }
-
-        message_type = ntohs(hdr->message_type);
-        switch (message_type)
-        {
-            case STUN_MSG_TYPE_BINDING_RESPONSE:
-                return es_local_process_binding_response(node, &msg);
-            case STUN_MSG_TYPE_BINDING_ERROR:
-                return es_local_process_binding_error(node, &msg);
-            default:
-                warn("Got unsupported message");
-                break;
-        }
-
-        processed = ES_TRUE;
+        /* Wrong TID - silently drop in fast path, log only if needed */
+        return ES_EWRONGTID;
     }
-    ES_BREAKABLE_END();
 
-    if (processed)
-        return ES_EOK;
-
-    /* can be connection request */
-    return es_local_conn_request(node, buf, ret);
+    /* Process STUN message type */
+    message_type = ntohs(hdr->message_type);
+    switch (message_type)
+    {
+        case STUN_MSG_TYPE_BINDING_RESPONSE:
+            return es_local_process_binding_response(node, &msg);
+            
+        case STUN_MSG_TYPE_BINDING_ERROR:
+            return es_local_process_binding_error(node, &msg);
+            
+        default:
+            /* Unknown message type - drop silently in fast path */
+            return ES_EOK;
+    }
 }

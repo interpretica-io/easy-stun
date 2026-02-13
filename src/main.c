@@ -3,8 +3,58 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/socket.h>
 #include "stun.h"
 #include "debug.h"
+
+#define SOCKET_RCVBUF_SIZE (2 * 1024 * 1024)  /* 2MB receive buffer */
+
+static int
+optimize_socket(int sockfd)
+{
+    int rcvbuf_size = SOCKET_RCVBUF_SIZE;
+    int flags;
+    int enable = 1;
+
+    /* Increase receive buffer size for burst traffic */
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size)) < 0)
+    {
+        warn("Failed to set SO_RCVBUF: %s", strerror(errno));
+    }
+
+    /* Enable address reuse */
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) < 0)
+    {
+        warn("Failed to set SO_REUSEADDR: %s", strerror(errno));
+    }
+
+#ifdef SO_REUSEPORT
+    /* Enable port reuse for better performance */
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &enable, sizeof(enable)) < 0)
+    {
+        warn("Failed to set SO_REUSEPORT: %s", strerror(errno));
+    }
+#endif
+
+    /* Set socket to non-blocking mode */
+    flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags == -1)
+    {
+        err("Failed to get socket flags: %s", strerror(errno));
+        return -1;
+    }
+
+    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) == -1)
+    {
+        err("Failed to set non-blocking: %s", strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
 
 int main(int argc, const char *argv[])
 {
@@ -55,6 +105,12 @@ int main(int argc, const char *argv[])
         {
             err("Failed to bind");
             goto restart;
+        }
+
+        /* Optimize socket for high-performance packet reception */
+        if (optimize_socket(node->sk) < 0)
+        {
+            warn("Socket optimization failed, continuing anyway");
         }
 
         rc = es_local_start_recv(node);

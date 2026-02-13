@@ -36,20 +36,41 @@ timer_callback_rebind(void)
 {
     es_bool rebind = ES_FALSE;
     es_bool keep_alive = ES_FALSE;
+    es_status rc;
+    int packets_processed = 0;
+    int max_burst = 100;  /* Process up to 100 packets per timer tick */
 
     counter++;
 
-    if (es_status_is_conn_broken(es_local_recv(loop_node)))
+    /* Burst processing - drain receive queue */
+    while (packets_processed < max_burst)
+    {
+        rc = es_local_recv(loop_node);
+
+        if (rc == ES_ENODATA)
+        {
+            /* No more data available */
+            break;
+        }
+        else if (es_status_is_conn_broken(rc))
+        {
+            rebind = ES_TRUE;
+            break;
+        }
+
+        packets_processed++;
+    }
+
+    if (rebind)
     {
         dbg("[%s:%u] Connection is broken - rebind",
             loop_node->params.remote_addr,
             (unsigned)loop_node->params.remote_port);
-        rebind = ES_TRUE;
-
         es_twoway_bind(loop_node);
     }
 
-    if ((counter % loop_node->params.keepalive_interval) == 0)
+    /* Keepalive check - counter increments every 100ms, so multiply by 10 for seconds */
+    if ((counter % (loop_node->params.keepalive_interval * 10)) == 0)
     {
         dbg("[%s:%u] Connection needs keepalive - ping",
             loop_node->params.remote_addr,
@@ -115,10 +136,11 @@ es_local_start_recv(es_node *node)
 #endif
     sigev.sigev_value.sival_int = 1;
 
-    value.it_value.tv_sec = 1;
-    value.it_value.tv_nsec = 0;
-    value.it_interval.tv_sec = 1;
-    value.it_interval.tv_nsec = 0;
+    /* Set timer to 100ms for faster packet processing */
+    value.it_value.tv_sec = 0;
+    value.it_value.tv_nsec = 100000000;  /* 100ms */
+    value.it_interval.tv_sec = 0;
+    value.it_interval.tv_nsec = 100000000;  /* 100ms */
 
     if (timer_create(USED_CLOCK, &sigev, &timer) != 0)
     {
